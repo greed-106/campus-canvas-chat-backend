@@ -3,41 +3,50 @@ package services
 import (
 	"campus-canvas-chat/database"
 	"campus-canvas-chat/models"
+	campusredis "campus-canvas-chat/redis"
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
+	"github.com/go-redis/redis/v8"
 	"gorm.io/gorm"
 )
 
 type MessageService struct {
-	db *gorm.DB
+	db          *gorm.DB
+	redisClient *redis.Client
 }
 
 func NewMessageService() *MessageService {
 	return &MessageService{
-		db: database.GetDB(),
+		db:          database.GetDB(),
+		redisClient: campusredis.GetClient(),
 	}
 }
 
-// SendGroupMessage 发送群聊消息（持久化存储）
+// SendGroupMessage 发送群聊消息（先存入Redis，缓存存入失败后再写入MySQL）
 func (s *MessageService) SendGroupMessage(chatRoomID, userID int64, content string) (*models.Message, error) {
 	// 检查用户是否是聊天室成员且未被禁言
-	var member models.ChatRoomMember
-	if err := s.db.Where("chat_room_id = ? AND user_id = ?", chatRoomID, userID).First(&member).Error; err != nil {
-		return nil, errors.New("用户不是该聊天室成员")
-	}
+	// var member models.ChatRoomMember
+	// if err := s.db.Where("chat_room_id = ? AND user_id = ?", chatRoomID, userID).First(&member).Error; err != nil {
+	// 	return nil, errors.New("用户不是该聊天室成员")
+	// }
 
-	if member.IsMuted {
-		return nil, errors.New("用户已被禁言")
-	}
+	// if member.IsMuted {
+	//     return nil, errors.New("用户已被禁言")
+	// }
 
-	// 获取用户名
-	var username string
-	if err := s.db.Model(&models.User{}).Where("id = ?", userID).Select("username").Scan(&username).Error; err != nil {
-		return nil, errors.New("用户不存在")
-	}
+	// // 获取用户名
+	// var username string
+	// if err := s.db.Model(&models.User{}).Where("id = ?", userID).Select("username").Scan(&username).Error; err != nil {
+	//     return nil, errors.New("用户不存在")
+	// }
 
-	// 创建并保存消息到数据库
+	// 创建消息对象
 	message := &models.Message{
 		ChatRoomID: chatRoomID,
 		UserID:     userID,
@@ -45,8 +54,39 @@ func (s *MessageService) SendGroupMessage(chatRoomID, userID int64, content stri
 		CreatedAt:  time.Now(),
 	}
 
-	if err := s.db.Create(message).Error; err != nil {
-		return nil, errors.New("发送消息失败")
+	// 将消息转换为JSON
+	messageJSON, err := json.Marshal(message)
+	if err != nil {
+		return nil, errors.New("消息序列化失败")
+	}
+
+	// 生成随机Redis键名
+	randomBytes := make([]byte, 16)
+	_, err = rand.Read(randomBytes)
+	if err != nil {
+		return nil, errors.New("生成随机键失败: " + err.Error())
+	}
+
+	// 使用Base64编码随机字节，并添加前缀和聊天室ID
+	randomKey := base64.URLEncoding.EncodeToString(randomBytes)
+	redisKey := fmt.Sprintf("chatroom:messages:%d:%s", chatRoomID, randomKey)
+
+	// 尝试将消息存入Redis
+	ctx := context.Background()
+	err = s.redisClient.LPush(ctx, redisKey, string(messageJSON)).Err()
+
+	// 设置过期时间（例如7天）
+	s.redisClient.Expire(ctx, redisKey, 1*time.Hour)
+
+	// 如果Redis存储失败，则存入MySQL
+	if err != nil {
+		// Redis存储失败，记录日志
+		fmt.Printf("Redis存储消息失败: %v，将消息存入MySQL\n", err)
+
+		// 存入MySQL数据库
+		if err := s.db.Create(message).Error; err != nil {
+			return nil, errors.New("发送消息失败: " + err.Error())
+		}
 	}
 
 	return message, nil
